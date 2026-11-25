@@ -512,7 +512,10 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual((everyone["ips"], [entry["action"] for entry in everyone["permissions"]]), (["127.0.0.1", "::1"], ["publish", "read"]))
         self.assertEqual((viewer["user"], viewer["pass"], [entry["action"] for entry in viewer["permissions"]]), ("viewer", "abcd1234", ["read"]))
         self.assertEqual(written["paths"], {"program": {}, "camera2": {"source": "rtsp://192.0.2.5:554/video1", "sourceOnDemand": True, "rtspTransport": "tcp"}})
-        self.assertEqual((written["webrtcAdditionalHosts"], written["rtspAddress"], written["rtmpAddress"]), (["studio.example.com"], "127.0.0.1:8554", "127.0.0.1:1935"))
+        self.assertEqual((written["webrtcAdditionalHosts"], written["rtspAddress"]), (["studio.example.com"], "127.0.0.1:8554"))
+        # Port 1935 is left to the computer's RTMP server.
+        self.assertIs(written["rtmp"], False)
+        self.assertNotIn("rtmpAddress", written)
 
     def test_a_camera_rtsp_stream_goes_through_the_relay_without_ffmpeg(self):
         shown = []
@@ -661,7 +664,7 @@ class BridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             server.MediaRelay(server.clean_relay(None), program="/usr/bin/true", folder=folder).show_cameras({0: "rtsp://192.0.2.5/x"})
             written = json.loads((Path(folder) / "relay.yml").read_text())
-        self.assertTrue(all(written[name] is False for name in ("moq", "hls", "srt", "api", "metrics", "playback", "pprof")))
+        self.assertTrue(all(written[name] is False for name in ("moq", "rtmp", "hls", "srt", "api", "metrics", "playback", "pprof")))
 
     def test_a_router_that_refuses_is_reported_not_hidden(self):
         self.fake_router(refuse=True)

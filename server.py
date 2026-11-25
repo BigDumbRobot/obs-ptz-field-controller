@@ -437,7 +437,7 @@ class MediaRelay:
     """Hands video that is already encoded on to viewers over WebRTC, untouched.
 
     The relay is MediaMTX, run as a helper beside the bridge. Whatever is published to it (OBS's own stream,
-    sent by WHIP, RTMP or RTSP) and whatever RTSP streams the cameras offer are passed to viewers packet for
+    sent by WHIP or RTSP) and whatever RTSP streams the cameras offer are passed to viewers packet for
     packet, with nothing decoded or encoded on the way, so it adds next to no delay or load. Viewers connect
     with WHEP, the standard way to watch a WebRTC stream, so the apps and pages are not tied to this relay.
 
@@ -472,7 +472,7 @@ class MediaRelay:
     def ports(self):
         """What the relay listens on: (protocol, port, address)."""
         s = self.settings
-        return [("TCP", s["webrtcPort"], ""), ("UDP", s["udpPort"], ""), ("TCP", s["rtspPort"], "127.0.0.1"), ("TCP", s["rtmpPort"], "127.0.0.1")]
+        return [("TCP", s["webrtcPort"], ""), ("UDP", s["udpPort"], ""), ("TCP", s["rtspPort"], "127.0.0.1")]
 
     def clean_up_ports(self):
         """Before starting: stop relays an earlier bridge left behind, and say which ports another program holds."""
@@ -544,7 +544,8 @@ class MediaRelay:
             # interface); each one not used is named here and switched off.
             "logLevel": "warn", "api": False, "metrics": False, "pprof": False, "playback": False, "hls": False, "srt": False, "moq": False,
             "rtsp": True, "rtspAddress": f"127.0.0.1:{settings['rtspPort']}", "rtspTransports": ["tcp"],
-            "rtmp": True, "rtmpAddress": f"127.0.0.1:{settings['rtmpPort']}",
+            # No RTMP: port 1935 is kept for the computer's RTMP server (OBS sends here by WHIP).
+            "rtmp": False,
             "webrtc": True, "webrtcAddress": f":{settings['webrtcPort']}", "webrtcLocalUDPAddress": f":{settings['udpPort']}",
             # Viewers outside are told the outside address; viewers inside find the relay by its own addresses.
             "webrtcAdditionalHosts": settings["hosts"] + ([self.router.outside] if self.router.outside and self.router.outside not in settings["hosts"] else []),

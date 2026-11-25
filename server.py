@@ -353,6 +353,85 @@ class PortForwarder:
         self.outside = ""
         self.note = "Outside viewing is off"
 
+    def clear_stale(self, ports):
+        """Remove forwardings a bridge that didn't shut down left on the router: only ours (by name) and only to
+        this computer, so another program's or another computer's forwardings are never touched. Returns what was removed."""
+        try:
+            self._find()
+        except (RuntimeError, OSError, HTTPException):
+            return []
+        removed = []
+        for protocol, port in ports:
+            try:
+                entry = self._ask("GetSpecificPortMappingEntry", NewRemoteHost="", NewExternalPort=port, NewProtocol=protocol)
+            except (RuntimeError, OSError, HTTPException):
+                continue  # nothing forwarded on that port (routers answer "NoSuchEntryInArray")
+            name = re.search(r"<NewPortMappingDescription>([^<]*)", entry)
+            client = re.search(r"<NewInternalClient>([^<]*)", entry)
+            if name and name.group(1) == self.NAME and client and client.group(1) == self.inside:
+                try:
+                    self._ask("DeletePortMapping", NewRemoteHost="", NewExternalPort=port, NewProtocol=protocol)
+                    removed.append((protocol, port))
+                except (RuntimeError, OSError, HTTPException):
+                    pass
+        return removed
+
+
+def stray_relays(config_path):
+    """Relay helpers left running by a bridge that was killed or crashed: processes started with this bridge's
+    relay.yml whose parent has gone (adopted by launchd/init, parent 1). They hold the relay's ports, so a new
+    relay can't start. Returns their process ids."""
+    try:
+        listing = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or parts[1] != "1":
+            continue
+        words = parts[2].split()
+        if str(config_path) in words and any(Path(word).name == "mediamtx" for word in words):
+            found.append(int(parts[0]))
+    return found
+
+
+def stop_processes(pids, wait=2.0):
+    """SIGTERM, then SIGKILL whatever is still there after `wait` seconds."""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.monotonic() + wait
+    while pids and time.monotonic() < deadline:
+        pids = [pid for pid in pids if _alive(pid)]
+        time.sleep(0.05)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def port_in_use(protocol, port, host=""):
+    """Whether something on this computer already holds the port."""
+    kind = socket.SOCK_STREAM if protocol == "TCP" else socket.SOCK_DGRAM
+    with socket.socket(socket.AF_INET, kind) as probe:
+        try:
+            probe.bind((host, port))
+            return False
+        except OSError:
+            return True
+
 
 class MediaRelay:
     """Hands video that is already encoded on to viewers over WebRTC, untouched.
@@ -374,12 +453,13 @@ class MediaRelay:
         self.process = None
         self.cameras = {}
         self.router = PortForwarder()
+        self.held = []
 
     def let_outside_in(self, wanted):
         """Open or close the way in from the internet, and tell viewers which outside address to use."""
         self.settings = {**self.settings, "outside": wanted}
         if wanted and self.running:
-            self.router.open([("TCP", self.settings["webrtcPort"]), ("UDP", self.settings["udpPort"])])
+            self.router.open(self.outside_ports())
         else:
             self.router.close()
         if self.program:
@@ -389,9 +469,32 @@ class MediaRelay:
     def running(self):
         return self.process is not None and self.process.poll() is None
 
+    def ports(self):
+        """What the relay listens on: (protocol, port, address)."""
+        s = self.settings
+        return [("TCP", s["webrtcPort"], ""), ("UDP", s["udpPort"], ""), ("TCP", s["rtspPort"], "127.0.0.1"), ("TCP", s["rtmpPort"], "127.0.0.1")]
+
+    def clean_up_ports(self):
+        """Before starting: stop relays an earlier bridge left behind, and say which ports another program holds."""
+        stray = stray_relays(self.config_path)
+        if stray:
+            print(f"Stopping {len(stray)} video relay(s) left running by an earlier bridge", flush=True)
+            stop_processes(stray)
+        # Another program on the same port doesn't always stop the relay (macOS lets it take 127.0.0.1 beside a
+        # program on every address), so this only becomes the reason when the relay then fails to run.
+        self.held = [f"{protocol} {port}" for protocol, port, host in self.ports() if port_in_use(protocol, port, host)]
+
+    @property
+    def note(self):
+        """Why the relay isn't running, when other programs hold its ports."""
+        if self.held and self.program and not self.running:
+            return f"Another program is using {' and '.join(self.held)}, so the video relay can't start"
+        return ""
+
     def start(self):
         if not self.program:
             return
+        self.clean_up_ports()
         self._write()
         try:
             # Run from the settings folder: the relay writes a certificate of its own beside where it is started.
@@ -399,9 +502,15 @@ class MediaRelay:
                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             self.process = None
+        # Asking the router takes a few seconds, so it doesn't hold the bridge's start up.
         if self.settings["outside"]:
-            # Asking the router takes a few seconds, so it doesn't hold the bridge's start up.
             threading.Thread(target=self.let_outside_in, args=(True,), daemon=True).start()
+        else:
+            # Outside viewing is off: forwardings a bridge that didn't shut down left on the router come off.
+            threading.Thread(target=self.router.clear_stale, args=(self.outside_ports(),), daemon=True).start()
+
+    def outside_ports(self):
+        return [("TCP", self.settings["webrtcPort"]), ("UDP", self.settings["udpPort"])]
 
     def stop(self):
         if self.process is None:
@@ -431,7 +540,9 @@ class MediaRelay:
             # Fetched only while someone is watching, so an idle camera is left alone.
             paths[self.camera_path(index)] = {"source": address, "sourceOnDemand": True, "rtspTransport": "tcp"}
         config = {
-            "logLevel": "warn", "api": False, "metrics": False, "pprof": False, "playback": False, "hls": False, "srt": False,
+            # MediaMTX adds servers that are on by default (1.21 opened MoQ on TCP/UDP 8892-8893 on every
+            # interface); each one not used is named here and switched off.
+            "logLevel": "warn", "api": False, "metrics": False, "pprof": False, "playback": False, "hls": False, "srt": False, "moq": False,
             "rtsp": True, "rtspAddress": f"127.0.0.1:{settings['rtspPort']}", "rtspTransports": ["tcp"],
             "rtmp": True, "rtmpAddress": f"127.0.0.1:{settings['rtmpPort']}",
             "webrtc": True, "webrtcAddress": f":{settings['webrtcPort']}", "webrtcLocalUDPAddress": f":{settings['udpPort']}",
@@ -1335,6 +1446,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"remote": {"password": self.password, "port": self.server.server_port, "on": listening not in {"127.0.0.1", "::1", "localhost"},
                            "addresses": own_addresses()},
                 "relay": {"running": bool(self.relay and self.relay.running), "port": self.relay.settings["webrtcPort"] if self.relay else 0,
+                          "note": self.relay.note if self.relay else "",
                           "key": self.relay.settings["viewKey"] if self.relay else "",
                           "outside": bool(self.relay and self.relay.settings["outside"]),
                           "outsideAddress": self.relay.router.outside if self.relay else "", "outsideNote": self.relay.router.note if self.relay else ""},

@@ -21,7 +21,7 @@ Drive PTZ cameras from a game controller, in a dock inside OBS Studio or in any 
 
 **macOS (Apple silicon)**
 
-1. Double-click `ptz-field-controller-1.5.0-macos-arm64.pkg` and click through the installer. It puts the plugin in your OBS plugins folder; there are no files to move and no password to enter.
+1. Double-click `ptz-field-controller-1.5.1-macos-arm64.pkg` and click through the installer. It puts the plugin in your OBS plugins folder; there are no files to move and no password to enter.
 2. Open OBS (quit and reopen it if it was running). The controller appears as its own panel the first time; drag it into the OBS window to dock it. Later it is under Docks → PTZ Field Controller.
 3. Press the gear in the panel, enter each camera's IP address, and save.
 4. Plug in the controller and press any button on it.

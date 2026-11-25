@@ -2,6 +2,7 @@ import functools
 import json
 import socket
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -515,7 +516,7 @@ class BridgeTests(unittest.TestCase):
 
     def test_a_camera_rtsp_stream_goes_through_the_relay_without_ffmpeg(self):
         shown = []
-        relay = mock.Mock(running=True, settings=server.clean_relay({"viewKey": "abcd1234"}), router=server.PortForwarder(),
+        relay = mock.Mock(running=True, note="", settings=server.clean_relay({"viewKey": "abcd1234"}), router=server.PortForwarder(),
                           show_cameras=lambda streams: shown.append(dict(streams)))
         port = self.rtsp_camera()
         with mock.patch.object(Handler, "relay", relay), mock.patch.object(Handler, "ffmpeg", None), \
@@ -548,9 +549,11 @@ class BridgeTests(unittest.TestCase):
             urlopen(f"{self.base_url}/feed", timeout=2)
         self.assertEqual(missing.exception.code, 404)
 
-    def fake_router(self, refuse=False):
-        """A stand-in router: describes itself as UPnP gateways do and records what it is asked."""
+    def fake_router(self, refuse=False, entries=None):
+        """A stand-in router: describes itself as UPnP gateways do and records what it is asked.
+        entries: {(protocol, port): (description, inside address)} it already forwards."""
         asked = []
+        entries = entries or {}
 
         class Router(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -568,6 +571,18 @@ class BridgeTests(unittest.TestCase):
                     self.send_response(500)
                     self.end_headers()
                     self.wfile.write(b"<errorCode>718</errorCode><errorDescription>ConflictInMappingEntry</errorDescription>")
+                    return
+                if action == "GetSpecificPortMappingEntry":
+                    fields = asked[-1][1]
+                    entry = entries.get((fields["NewProtocol"], int(fields["NewExternalPort"])))
+                    if entry is None:
+                        self.send_response(500)
+                        self.end_headers()
+                        self.wfile.write(b"<errorCode>714</errorCode><errorDescription>NoSuchEntryInArray</errorDescription>")
+                        return
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(f"<NewInternalClient>{entry[1]}</NewInternalClient><NewPortMappingDescription>{entry[0]}</NewPortMappingDescription>".encode())
                     return
                 self.send_response(200)
                 self.end_headers()
@@ -602,9 +617,55 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(json.loads((Path(folder) / "relay.yml").read_text())["webrtcAdditionalHosts"], [])
             relay.process = None
 
+    def test_forwardings_left_behind_come_off_but_nobody_elses(self):
+        asked = self.fake_router(entries={("TCP", 8889): ("PTZ Field video", "127.0.0.1"), ("UDP", 8189): ("Someone's game", "127.0.0.1"),
+                                          ("TCP", 9000): ("PTZ Field video", "192.0.2.50")})
+        removed = server.PortForwarder().clear_stale([("TCP", 8889), ("UDP", 8189), ("TCP", 9000), ("UDP", 9001)])
+        self.assertEqual(removed, [("TCP", 8889)])
+        self.assertEqual([(f["NewProtocol"], f["NewExternalPort"]) for action, f in asked if action == "DeletePortMapping"], [("TCP", "8889")])
+
+    def test_a_relay_left_running_by_an_earlier_bridge_is_stopped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "relay.yml"
+            fake = Path(folder) / "mediamtx"
+            fake.write_text("#!/bin/sh\nexec sleep 30\n")
+            fake.chmod(0o755)
+            other = Path(folder) / "other.yml"
+            # Started from a shell that exits at once, as if its bridge had been killed: the relay's parent becomes 1.
+            subprocess.run(["sh", "-c", f"'{fake}' '{config}' >/dev/null 2>&1 & '{fake}' '{other}' >/dev/null 2>&1 &"], check=True)
+            deadline = time.monotonic() + 3
+            while len(server.stray_relays(config)) < 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            stray = server.stray_relays(config)
+            self.assertEqual(len(stray), 1, "only the relay started with this bridge's relay.yml")
+            mine = server.stray_relays(other)
+            server.stop_processes(stray)
+            self.assertFalse(server._alive(stray[0]))
+            self.assertTrue(all(server._alive(pid) for pid in mine), "another bridge's relay is left alone")
+            server.stop_processes(mine)
+
+    def test_relay_says_when_another_program_holds_its_port(self):
+        holder = socket.socket()
+        holder.bind(("", 0))
+        holder.listen()
+        self.addCleanup(holder.close)
+        with tempfile.TemporaryDirectory() as folder:
+            relay = server.MediaRelay(server.clean_relay({"viewKey": "abcd1234", "webrtcPort": holder.getsockname()[1]}), program="/usr/bin/true", folder=folder)
+            relay.clean_up_ports()
+            self.assertIn(f"TCP {holder.getsockname()[1]}", relay.note, "not running: the held port is the reason")
+            relay.process = mock.Mock(poll=lambda: None)
+            self.assertEqual(relay.note, "", "running anyway: nothing to report")
+            relay.process = None
+
+    def test_relay_switches_off_servers_it_does_not_use(self):
+        with tempfile.TemporaryDirectory() as folder:
+            server.MediaRelay(server.clean_relay(None), program="/usr/bin/true", folder=folder).show_cameras({0: "rtsp://192.0.2.5/x"})
+            written = json.loads((Path(folder) / "relay.yml").read_text())
+        self.assertTrue(all(written[name] is False for name in ("moq", "hls", "srt", "api", "metrics", "playback", "pprof")))
+
     def test_a_router_that_refuses_is_reported_not_hidden(self):
         self.fake_router(refuse=True)
-        relay = mock.Mock(running=True, settings=server.clean_relay({"viewKey": "abcd1234"}), router=server.PortForwarder())
+        relay = mock.Mock(running=True, note="", settings=server.clean_relay({"viewKey": "abcd1234"}), router=server.PortForwarder())
         relay.let_outside_in = lambda wanted: relay.router.open([("TCP", 8889)])
         with mock.patch.object(Handler, "relay", relay):
             response = self.send({"v": 8, "outside": True}, "/api/outside", want_response=True)

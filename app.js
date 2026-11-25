@@ -349,7 +349,7 @@ function adoptRoom(room) {
   relay = room.relay;
   document.documentElement.classList.toggle("has-relay", relay.running);
   byId("outsideInput").checked = relay.outside;
-  byId("outsideHelp").textContent = relay.outside
+  byId("outsideHelp").textContent = relay.note ? `${relay.note}.` : relay.outside
     ? `${relay.outsideNote}.${relay.outsideAddress ? ` This network's outside address is ${relay.outsideAddress}.` : ""}`
     : "Off: the video can only be watched on this network. Switching it on asks the router to let viewers in from the internet; they still need a link with the view key.";
   byId("remotePassword").value = remote.password;
